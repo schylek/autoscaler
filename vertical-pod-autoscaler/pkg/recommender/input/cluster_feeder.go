@@ -25,15 +25,16 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
-	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1beta1"
+	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1beta2"
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
-	vpa_api "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/autoscaling.k8s.io/v1beta1"
-	vpa_lister "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/listers/autoscaling.k8s.io/v1beta1"
+	vpa_api "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/autoscaling.k8s.io/v1beta2"
+	vpa_lister "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/listers/autoscaling.k8s.io/v1beta2"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/metrics"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/oom"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/spec"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
+	target "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 	kube_client "k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -76,6 +77,7 @@ type ClusterStateFeederFactory struct {
 	VpaLister           vpa_lister.VerticalPodAutoscalerLister
 	PodLister           v1lister.PodLister
 	OOMObserver         oom.Observer
+	SelectorFetcher     target.VpaTargetSelectorFetcher
 }
 
 // Make creates new ClusterStateFeeder with internal data providers, based on kube client.
@@ -88,6 +90,7 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 		vpaLister:           m.VpaLister,
 		clusterState:        m.ClusterState,
 		specClient:          spec.NewSpecClient(m.PodLister),
+		selectorFetcher:     m.SelectorFetcher,
 	}
 }
 
@@ -101,9 +104,10 @@ func NewClusterStateFeeder(config *rest.Config, clusterState *model.ClusterState
 		OOMObserver:         oomObserver,
 		KubeClient:          kubeClient,
 		MetricsClient:       newMetricsClient(config),
-		VpaCheckpointClient: vpa_clientset.NewForConfigOrDie(config).AutoscalingV1beta1(),
+		VpaCheckpointClient: vpa_clientset.NewForConfigOrDie(config).AutoscalingV1beta2(),
 		VpaLister:           vpa_api_util.NewAllVpasLister(vpa_clientset.NewForConfigOrDie(config), make(chan struct{})),
 		ClusterState:        clusterState,
+		SelectorFetcher:     target.NewVpaTargetSelectorFetcher(),
 	}.Make()
 }
 
@@ -180,6 +184,7 @@ type clusterStateFeeder struct {
 	vpaCheckpointClient vpa_api.VerticalPodAutoscalerCheckpointsGetter
 	vpaLister           vpa_lister.VerticalPodAutoscalerLister
 	clusterState        *model.ClusterState
+	selectorFetcher     target.VpaTargetSelectorFetcher
 }
 
 func (feeder *clusterStateFeeder) InitFromHistoryProvider(historyProvider history.HistoryProvider) {
@@ -296,7 +301,15 @@ func (feeder *clusterStateFeeder) LoadVPAs() {
 		vpaID := model.VpaID{
 			Namespace: vpaCRD.Namespace,
 			VpaName:   vpaCRD.Name}
-		if feeder.clusterState.AddOrUpdateVpa(vpaCRD) == nil {
+
+		selector, err := feeder.selectorFetcher.Fetch(vpaCRD)
+		if err != nil {
+			glog.Errorf("Cannot get target selector from VPA's targetRef. Reason: %+v", err)
+			// TODO: set condition on VPA
+			continue
+		}
+
+		if feeder.clusterState.AddOrUpdateVpa(vpaCRD, selector) == nil {
 			// Successfully added VPA to the model.
 			vpaKeys[vpaID] = true
 		}
